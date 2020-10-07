@@ -1,0 +1,430 @@
+---
+title: "FluView: Time Series Forecasting"
+author: "Andy Nguyen"
+date: "4/8/2020"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+options(warn = -1)
+```
+
+# FluView: Weekly Influenza Surveillance (2015-2020)
+
+Fluview is a weekly influenza surveillance report compiled by the Centers for Disease Control and Prevention (CDC) to analyze flu activity year-round in the United States. The primary objective of this study is to determine when influenza activity is occuring and how these patterns may be changing over time. 
+
+Specifics detailing the collection methods and purposes of FluView weekly surveillance report can be found at the following link: https://www.cdc.gov/flu/weekly/overview.htm.
+
+These weekly surveillance reports began back in the 1997-98 flu season, but only a subset of all that data will be considered to focus on flu trends in the past 5 years (October 2015 - February 2020). The response/target variable is the Total Flu Specimens during this time period. The reported data includes both influenza types A & B as well as their specific subtypes (A_H1N1, A_H3N2) and lineages (Victoria, Yamagata). There are also two other attributes included but were descibed to not be subtyped or lineaged. As a precaution, these attributes will be omitted in this analysis since there is insufficient domain knowledge to explain the potential impact.
+
+```{r Packages + Data, include=FALSE}
+library(tswge)
+library(vars)
+library(nnfor)
+library(dplyr)
+library(orcutt)
+library(pastecs)
+library(tidyverse)
+library(readr)
+library(rlist)
+
+# Data
+Flu_RawData <- read_csv("Data/WHO_NREVSS_Public_Health_Labs-R.csv")
+FluCases <- ts(data = Flu_RawData$`TOTAL SPECIMENS`, start = c(2015,40), frequency = 52)
+A_H1N1 <- ts(data = Flu_RawData$`A (2009 H1N1)`, start = c(2015,40), frequency = 52)
+A_H3N2 <- ts(data = Flu_RawData$`A (H3)` , start = c(2015,40), frequency = 52)
+A <- ts(data = Flu_RawData$`A (Subtyping not Performed)`, start = c(2015,40), frequency = 52) 
+B <- ts(data = Flu_RawData$B, start = c(2015,40), frequency = 52)
+B_Vic <- ts(data = Flu_RawData$BVic, start = c(2015,40), frequency = 52)
+B_Yam <- ts(data = Flu_RawData$BYam, start = c(2015,40), frequency = 52)
+# Lineage Not Performed: H3N2V <- ts(data = Flu_RawData$H3N2v, start = c(2015,40), frequency = 52)
+```
+<br>
+
+## Exploratory Data Analysis (EDA)
+
+The subsetted dataset from October 2015 to February 2020 appears to have null values for 'A (Subtyping not Performed)':41, 'B':11, 'BVic':21, 'BYam':14, and 'H3N2v':217 viral strains. The H3N2V feature in the dataset will not be considerd for this analysis as it contains mostly null values.
+
+Aggregating the data by weeks, flu activity begins to increase towards the end of the year and peaks around the middle of February, (6th week of the year). Activity begins to fall off again around the end of March (roughly the 12th week). This suggests that these trends in flu activity over the past 5 years follow a periodic behavior that cycles annually.  
+
+```{r EDA: Basic Statistics, echo=FALSE}
+# summary(Flu_RawData)
+stat.desc(Flu_RawData)
+
+# Since we suspect yearly trend - aggregate by week to observe peak weeks for flu activity
+Weekly_Flu = aggregate(Flu_RawData, by = list(Flu_RawData$WEEK), FUN = mean) # Which weeks of the year have the most flu cases on average?
+barplot(Weekly_Flu$`TOTAL SPECIMENS`, 
+        main = 'Average Flu Cases Per Week', 
+        xlab = "Week Number In a Year", ylab = "Average Flu Cases (Total Specimen)", names.arg = c(1:52))
+```
+<br>
+
+### Stationary Exploration
+
+The realization of the Flu Time Series Data show clear peaks repeating around every 50 weeks with the most pronounced peak around week 125. This suggests an annaul trend in the data and is consistent with the fact that influenza viruses typically circulate every year. The seasonal trend in the data is expected to be a factor of s = 52 weeks (~1 year). The peaks repeating every year indicate that the mean depends on time and is not constant throughout the time series. This violation provides evidence to suggest that the time series data comes from a **non-stationary process**.
+
+Assessing the constant variance assumption over time, the peaks all appear to be approximately the same size despite Week 125 being more pronounced. There is some evidence to suggest that the variances do not depend on time, but this is a questionable assumption since the mean can not be assumed to be constant throughout the time series.
+
+``` {r EDA: Realization}
+plotts.wge(FluCases)
+```
+<br>
+
+The autocorrelation function of the flu data exhibits a dampening sinusoidal pattern, suggesting that the time series may contain complex conjugate roots when modeling autoregressive behavior. The period of the dampening sinusoid appears to be around 50, with the apex of the curve repeating roughly at an autocorrelation value of lag 50.
+
+The simple check of the autocorrelations of the first and second half of the time series data seem to resemble one another as well as the ACF of the full time series. This provides evidence that the correlations of data points only depend on how far apart they are and not on where they are at in time.
+
+
+``` {r EDA: ACF}
+layout(matrix(c(1,1,2,3), 2, 2, byrow = TRUE))
+acf(FluCases, lag.max = 100) # Full Time Series Data
+acf(FluCases[0:115], lag.max = 100) # First Half of Time Series Data
+acf(FluCases[116:230], lag.max = 100) # Second Half of Time Series Data
+```
+<br>
+
+Considering all three conditions to assume a stationary time series, the influenza data appears to come from a **non-stationary process** because it violates the condition of a constant mean. There appears to be a seasonality in the data that repeats annually. Analyzing the spectral density from reported flu cases, there is a visible peak at f = 0 that suggests wandering behavior in the time series data. There also appears to be 2 troughs present roughly around f = 0.28 and f = 0.45, this suggests that there are moving average components present. Based off this initial EDA, an ARMA model seems to be appropriate to account for the autoregressive and moving average behaviors observed in the Influenza data.
+
+``` {r EDA: Spectral Density}
+parzen.wge(FluCases)
+```
+<br>
+<br>
+
+## Competing Forecast Models
+
+
+### Univariate Analysis
+
+Due to the damped sinusodial behavior observed in the ACFs and evidence of troughs in the spectral densities, an autoregressive moving-average (ARMA) model was fitted to the data.
+
+To model for the potential seasonal trend of 52 weeks, the flu data was overfit to a factor table of 58 to account for autoregressive behaviors up to order p=6 and a seasonal order of 52. Comparing the overfit factor table to an (1-B^52) factor table, the only factor from the seasonal factor table exhibiting similar behavior as the flu data is (1+1.4970B+1.0000B^2). The factor from the data was (1+1.4974B+0.9394B^2) and had a root close to the unit circle with absoulte reciprocal value of 0.9692 and system frequency of 0.3905 (there is evidence of a slight peak around this frequency in the spectral density).
+
+
+```{r ARMA/seasonal estimates, include=FALSE}
+# ARMA Estimates
+aic5.wge(FluCases, p = 0:8, q = 0:8) #ARMA(6,4) AIC: 11.38255
+# aic5.wge(FluCases, p = 0:8, q = 0:8, type = 'bic') # ARMA(2,1) BIC: 11.48721
+
+# Arma Model ID
+ARMA.est = est.arma.wge(FluCases, p = 6, q = 4)
+#ARMA.est$avar # 79769.82
+#FluCases.mean = mean(FluCases) # 1909.77
+
+
+# Seasonal Trend Diagnosis - Overfit Factor Tables
+S58 = est.ar.wge(FluCases, p = 58, type = "burg")
+factor.wge(phi = c(rep(0,51),1))
+
+# Seasonal Estimates + Model ID
+flu.sdiff = artrans.wge(FluCases, phi.tr = c(rep(0,51),1))
+aic5.wge(flu.sdiff, p = 0:8, q = 0:8) # ARMA(5,2) | AIC: 11.74528
+seasonal.est = est.arma.wge(flu.sdiff, p = 5, q = 2)
+#seasonal.est$avar
+
+```
+
+#### [Autoregressive Moving-Average] ARMA(6,4) Forecasts
+
+Statisical evidence from the AIC criterion suggested a stationary model fitted to an autoregresssive order of 6 and moving-averge order of 4 ARMA(6,4). The initial ASE from the ARMA forecasts of the last 12 weeks in the dataset is 957,608.8.
+
+```{r ARMA Forecasts}
+# ARMA Forecasts (stationary)
+flu.ARMA.fore = fore.arma.wge(FluCases, phi = ARMA.est$phi, theta = ARMA.est$theta, n.ahead=12, lastn=TRUE)
+flu.ARMA.ase = mean((FluCases[(length(FluCases)-11):length(FluCases)]-flu.ARMA.fore$f)^2)
+#flu.ARMA.ase # 957608.8
+```
+<br>
+
+#### [ARMA + Seasonal] ARUMA(5,0,2) w/ s = 52 Forecasts
+
+Differencing the data by the second-order factor (1+1.4970B+1.0000B^2) and fitting an ARMA(3,2), the model attempted to explain the seasonality using that factor with a cycle length of 52. However, this model performed considerably worse than the previous ARMA(6,4) model with an ASE calculated from the last 12 weeks of 9,405,650.
+
+Exploring altnerative seasonal models, the data was differenced by a seasonal factor of (1-B^52) to explain the expected annual trends of flu activity. The AIC criterion suggested an autoregressive order of 5 and moving-average order of 2 to be fitted to the seasonal model when differencing the data by 52 weeks. The initial ASE from these ARUMA(5,0,2) with s = 52 forecasts of the last 12 weeks is 1,185,825.
+
+Although this seasonal model was an improvement, the forecasts from the ARMA model were still better. Differencing the data by an s=52 factor to account for annual trends was not strongly supported from the observations of the overfitted factor tables. Only one complex conjugate root from the seasonal factor table seemed to be represented in the actual data. Since the overfit tables did not much provide miuch model identification support for differencing by (1-B^52), this may not be an appropriate model to explain the seasonal trend.
+
+```{r Seasonal Forecasts}
+# Seasonal Forecasts (non-stationary)
+flu.seasonal.fore = fore.aruma.wge(FluCases, phi = seasonal.est$phi, theta = seasonal.est$theta, d = 0, s = 52, n.ahead = 12, lastn = TRUE)
+flu.seasonal.ase = mean((FluCases[(length(FluCases)-11):length(FluCases)]-flu.seasonal.fore$f)^2)
+flu.seasonal.ase # 1,185,825
+```
+<br>
+
+#### Univariate Model Evaluation
+Analyzing the residuals from both unvariate models using 2 runs of the Ljung-Box test for each, the residuals fitted for both the ARMA(6,4) and ARUMA(5,0,2) w/ s = 52 appear to be whitened. The p-values >> 0.5 (all above 0.9) provide strong evidence to fail to reject the null hypothesis that the data is independently distributed and not serrially correlated.
+
+```{r Univariate Model Evaluation, include=FALSE}
+# Strong Evidence that residuals from fitted ARMA(6,4) model are white noise
+ljung.wge(ARMA.est$res, p=6, q=4, K=24)
+ljung.wge(ARMA.est$res, p=6, q=4, K=48)
+
+# Strong Evidence that residuals from fitted ARUMA(5,0,2) w/ s = 52 model are white noise
+ljung.wge(seasonal.est$res, p=5, q=2, K=24)
+ljung.wge(seasonal.est$res, p=5, q=2, K=48)
+```
+
+##### ARMA Residuals
+The plot of the residuals fitted from the ARMA model appear to be mostly white noise, but a slight pattern can still be observed repeating with a period of about 50 as previously seen in the realization. The residual sample autocorrelations resemble white noise as well with 95% of values within the limit lines.
+
+```{r ARMA Residual Plot Check}
+plotts.wge(ARMA.est$res)
+acf(ARMA.est$res)
+```
+<br>
+
+##### Seasonal Residuals
+The plot of the residuals fitted from the seasonal model appear to be white noise. A slight pattern can still be observed repeating with a period of about 50, but is much less defined compared to the residuals fitted from the ARMA model. The residual sample autocorrelations resemble white noise as well with 95% of values within the limit lines.
+
+```{R Seasonal Residual Plot Check}
+plotts.wge(seasonal.est$res)
+acf(seasonal.est$res)
+```
+<br>
+
+#### Rolling Window ASE for Univariate Models
+
+Using the rolling window ASE, forecasts errors for the following models throughout the time series can be observed rather than just the last 12 weeks from the dataset. A training window size of 104 weeks was used to forecast a 12 week horizon, and showed that the seasonal model yielded better generalized forecasts throughout the time series compared to the ARMA model. The rolling window ASE for the ARMA model was 2,257,269 while the rolling window ASE for the seasonal model was comparable to the ARMA(6,4) forecasts of the last 12 weeks at 921.505.7.
+
+Summary statistics for the 115 ASE values computed for the rolling window of each model are provided below. The distributions for both rolling errors appear to be similar with long right tails. The majority of errors are valued within the first 2 quantiles.  Due to the stationary nature of the ARMA(6,4) model, these forecasts may have regressed towards the mean. Since the flu data seemed to come from a non-stationary process, it makes sense that the seasonal model generalized better across the time series with the rolling window ASE demonstrating a better regression towards the actual trend in the data.
+
+```{r Univariate Rolling Window ASE, include=FALSE}
+trainingSize = 104
+horizon = 12
+ASEHolder.ARMA = numeric()
+ASEHolder.seasonal = numeric()
+
+for( i in 1:(230 - (trainingSize + horizon) + 1))
+{
+  ARMA.f = fore.arma.wge(FluCases[i:(i+(trainingSize-1))], phi = ARMA.est$phi, theta = ARMA.est$theta, n.ahead = horizon)
+  ARMA.ase = mean((FluCases[(trainingSize+i):(trainingSize+ i + (horizon) - 1) ] - ARMA.f$f)^2)
+  ASEHolder.ARMA[i] = ARMA.ase
+  
+  seasonal.f = fore.aruma.wge(FluCases[i:(i+(trainingSize-1))], phi = seasonal.est$phi, theta = seasonal.est$theta, d = 0, s = 52, n.ahead = horizon)
+  seasonal.ase = mean((FluCases[(trainingSize+i):(trainingSize+ i + (horizon) - 1) ] - seasonal.f$f)^2)
+  ASEHolder.seasonal[i] = seasonal.ase
+}
+```
+
+##### ARMA Rolling Window ASE
+``` {r ARMA Rolling Window ASE}
+summary(ASEHolder.ARMA)
+hist(ASEHolder.ARMA)
+WindowedASE.ARMA = mean(ASEHolder.ARMA) # 2,257,269
+```
+
+##### Seasonal Rolling Window ASE
+``` {r Seasonal Rolling Window ASE}
+summary(ASEHolder.seasonal)
+hist(ASEHolder.seasonal)
+WindowedASE.seasonal = mean(ASEHolder.seasonal) # 921,505.7
+```
+
+
+### Vector Auto-Regression (VAR) Models
+Building off the univarite model analysis, additional explanatory variables to help forecast flu activities trends will be included in a multivariate analysis. These variables are the specific subtypes and lineages of influenza virus strains: A_H1N1, A_H3N2, A (not subtyped), B (not lineaged), B_Victoria, B_Yamagata. As previously mentioned, the H3N2V variable will be omitted from this analysis due to the overwhelming number of null values.
+
+```{r VAR Models, include=FALSE}
+# Training Data
+FluCases.X = ts(FluCases[1:218])
+A_H1N1.X = ts(A_H1N1[1:218])
+A_H3N2.X = ts(A_H3N2[1:218])
+A.X = ts(A[1:218])
+B.X = ts(B[1:218])
+B_Vic.X = ts(B_Vic[1:218])
+B_Yam.X = ts(B_Yam[1:218])
+X = cbind(FluCases.X, A_H1N1.X, A_H3N2.X, A.X, B.X, B_Vic.X, B_Yam.X)
+
+# VAR Model fitted w/ s = 52
+VARselect(X, lag.max = 50, type = "trend", s = 52) # AIC picks p = 17
+VARfit52 = VAR(X, p = 17, type = "trend", s = 52)
+# Forecasts
+VAR52.preds = predict(VARfit52, n.ahead = 12)
+ASE.VAR52 = mean((FluCases[219:230] - VAR52.preds$fcst$FluCases.X[1:12,1])^2) # 125,585,906 
+
+
+# VAR Model estimated w/ s = 52, but not fitted to that frequency
+VARselect(X, lag.max = 50, type = "trend", s = 52) # AIC picks p = 17
+VARfit = VAR(X, p = 17, type = "trend")
+# Forecasts
+VAR.preds = predict(VARfit, n.ahead = 12)
+ASE.VAR = mean((FluCases[219:230] - VAR.preds$fcst$FluCases.X[1:12,1])^2) # 358,671.7 
+```
+
+Fitting the multivarite model with the additional explanatory variables from the data and a seasonal frequency of s=52, the estimated VAR(17) model yielded unreliable forecasts that severely overestimated the actual values (ASE = 128,585,906). The estimated model was calculated with a deterministic trend regressor and the exepected annual seasonality of 52 weeks. However, when the VAR(17) model, estimated using the same parameters, but not actually fitted with the a seasonal frequency of s=52 yielded much better forecasts of the last 12 weeks that appear to represent the trend well (ASE = 358,671.1). **Note: The VAR(17) model on the left is fitted with s = 52 [red squares] while the one on the right is not [green squres].**
+
+``` {r Competing VAR models Forecast Plots}
+plot(seq(1,230,1), FluCases, type = 'b')
+# Forecasts for s = 52 fitted VAR
+points(seq(219,230,1), VAR52.preds$fcst$FluCases.X[1:12,1], type = 'b', pch = 0, col = 'red')
+# Forecasts for unfitted VAR
+points(seq(219,230,1), VAR.preds$fcst$FluCases.X[1:12,1], type = 'b', pch = 20, col = 'green')
+```
+<br>
+
+As previously noted, the ARMA forecasts also performed better than the seasonal model that included the s = 52 factor. Despite the expected annual trend of influenza activity, models fitted to the anticipated seasonal frequency of 52 do not perform as well as ones trained using just autoregressive behaviors. It is an interesting observation to find that when the autoregressive order of the VAR model was estimated with the seasonal frequency but not actually fitted using the s=52 parameter, the forecasts were much better. This suggests that the annual trend can't be modeled using seasonal frequency factors (1-B^s) but might be better modeled using some other deterministic signal such as sine or cosine functions.
+
+#### VAR Model Evaluations
+The plot of the residuals fitted from both VAR(17) models appear to be mostly white noise. However, a slight pattern from the VAR(17) model fitted with a seasonal frequency of 52 [shown below] can still be observed repeating with a period of about 50 as previously seen in the realization. The residual sample autocorrelations resemble white noise as well with 95% of values within the limit lines.
+
+##### VAR Model fitted w/ s = 52
+```{r VAR fit with seasonal factor Residual Plot Check, fig.width=8, fig.height=8}
+plot(VARfit52, "FluCases.X")
+```
+<br>
+
+The residuals fitted to the VAR(17) model not fitted with the seasonal frequency of 52 weeks appear to better resemble white noise with no distinct repeating patterns. The residual sample autocorrelations resemble white noise as well with 95% of values within the limit lines. Due to ASE and residual plots, this second VAR model not fitted with s = 52 appears to be more useful in forecasting and analyzing the behaviors of flu activity.
+
+##### VAR Model not fitted w/ s = 52
+```{r VAR not fit with seasonal frequency Residual Plot Check, fig.width=8, fig.height=8}
+plot(VARfit, "FluCases.X")
+```
+
+### Neural Network Model
+
+```{r Neural Network Model, include=FALSE}
+set.seed(7)
+# Univariate Neural Network with time as explanatory variable
+t = data.frame(ts(1:230))
+NN.uni.fit = mlp(FluCases.X, xreg = t, hd = 5, reps = 20, difforder = c(1,52), m = 52)
+# Univariate NN Predictions
+f.NN.uni = forecast(NN.uni.fit, h = 12, xreg = t)
+ASE.NN.uni = mean((FluCases[219:230] - f.NN.uni$mean)^2) # 1,959,621.28
+
+# Multivariate Neural Network
+TS.fluX = data.frame(A_H1N1, A_H3N2, A, B, B_Yam, B_Vic)
+NN.multi.fit = mlp(FluCases.X, xreg = TS.fluX, sel.lag = TRUE, hd = 16, reps = 20, difforder = c(1,52), m = 52)
+# Multivariate NN Predictions
+f.NN.multi = forecast(NN.multi.fit, xreg = TS.fluX, h = 12)
+ASE.NN.multi = mean((FluCases[219:230] - f.NN.multi$mean)^2) # 2,717,874.75
+```
+
+#### Univariate Neural Network Model (UNN)
+```{r UNN}
+NN.uni.fit
+plot(NN.uni.fit)
+```
+
+Multilayer perceptron neural networks will be used to model complex non-linear trends in flu data for both univariate and multivariate analyses. In the univariate neural network (UNN), time was included as an explanatory variable and the data was differenced by factors of (1-B) and (1-B^52). The expected annual frequency of 52 weeks was included as a parameter when training the neural network with 5 hidden nodes in 20 networks. These parameters were selected after several iterations that were able to detect patterns in the forecast and had relatively lower ASE. The UNN that had the lowest ASE was trained on a first order difference of the data, but seemed to just forecast the mean value with a slowly increasing trend. Although it had the lowest ASE of all competing neural networks, the forecasts were not particularly useful because the model was not able to pick up on behaviors exhibited by the data.
+
+#### Multivariate Nueral Network Model (MNN)
+
+```{r MNN}
+NN.multi.fit
+plot(NN.multi.fit)
+```
+
+The multivariate neural network (MNN), included all the explanatory variables used in the VAR model. It appeared to perform better without the inclusion of a time explanatory variable as a regressor. Using 5-fold cross validation to select the optimal number of hidden nodes, 16 were selected. The expected annual frequency of 52 weeks was also included as a parameter with differences of both a first and fifty-second order when training the neural network on 20 repetitions. The number of lags for all regressors were automatically selected through the algorithm. Comparing the MSE of the forecasts calculated using the median operator, the UNN was 53597.65 and the MNN was 3426.10. However, the calculated ASE of the last 12 weeks of the data was better for the UNN (1,7409,931.53) than the MNN (3,979,653.94).
+
+Comparing the forecats from each model (UNN: red, MNN: blue), the UNN forecasts appear to overlap better with the actual data while the MNN forecasts consistently underestimate until about the 11th week. Based off the ASE, the UNN model appears to be more useful at forecasting the flu data. From these last 12 weeks, the UNN forecasts exhibits the most similar behavior despite the peak being predicted later in time. The MNN forecasts were also unable to pick up the decreasing trend following the 8th forecast, and instead continues to increase after the 10th forecast. 
+
+``` {r Competing NN Model Forecast Plots}
+plot(FluCases[219:230], type = "l", ylim = c(1500,6000))
+# Forecasts for univariate NN Model w/ time as explanatory variable
+lines(seq(1,12), f.NN.uni$mean, col = "red")
+# Forecasts for multivariate NN Model
+lines(seq(1,12), f.NN.multi$mean, col = "blue")
+```
+<br>
+
+#### Rolling Window ASE for Neural Network Models
+The same training size and forecast horizon as the rolling window ASE for the univariate models were used to analyze the rolling forecast errors of the Neural Network models. Both models performed similarly with the rolling window ASE for the UNN model at 8,446,740 and the rolling window ASE for the MNN model at 9,744,386.
+
+Summary statistics for the 115 ASE values computed for the rolling window of each model are provided below. The distributions for both rolling errors appear to be similar with long right tails. The majority of errors are valued within the first 2 quantiles. 
+
+``` {r Neural Network Rolling Window ASE, include=FALSE}
+trainingSize = 104
+horizon = 12
+ASEHolder.UNN = numeric()
+ASEHolder.MNN = numeric()
+
+t = data.frame(ts(1:230))
+TS.fluX = data.frame(A_H1N1, A_H3N2, A, B, B_Yam, B_Vic)
+
+for( i in 1:(230 - (trainingSize + horizon) + 1))
+{
+  FluCases.train = ts(FluCases[i:(i+(trainingSize-1))])
+
+  uniNN.fit = mlp(FluCases.train, xreg = t, hd = 5, reps = 20, difforder = c(1,52), m = 52)
+  f.uniNN = forecast(uniNN.fit, h = 12, xreg = t)
+  ASE.uniNN = mean((FluCases[(trainingSize+i):(trainingSize+ i + (horizon) - 1)] - f.uniNN$mean)^2)
+  ASEHolder.UNN[i] = ASE.uniNN
+  
+  multiNN.fit = mlp(FluCases.train, xreg = TS.fluX, sel.lag = TRUE, hd = 16, reps = 20, difforder = c(1,52), m = 52)
+  f.multiNN = forecast(multiNN.fit, xreg = TS.fluX, h = 12)
+  ASE.multiNN = mean((FluCases[(trainingSize+i):(trainingSize+i+(horizon)-1)] - f.multiNN$mean)^2)
+  ASEHolder.MNN[i] = ASE.multiNN
+}
+```
+
+##### Univariate Neural Network Rolling Window ASE
+``` {r UNN Rolling Window ASE}
+summary(ASEHolder.UNN)
+hist(ASEHolder.UNN)
+WindowedASE.UNN = mean(ASEHolder.UNN) # 8,446,740
+```
+
+##### Multivariate Neural Network Rolling Window ASE
+``` {r MNN Rolling Window ASE}
+summary(ASEHolder.MNN)
+hist(ASEHolder.MNN)
+WindowedASE.MNN = mean(ASEHolder.MNN) # 9,744,386
+```
+
+### Ensemble Models
+
+#### Stationary Ensemble Model: ARMA(6,4) & VAR(17) not fitted with s = 52
+Considering the complexity and breadth of modeling effort conducted already, it is worth exploring logical ensembles of the models already established. The first is an ensemble of the stationary models: ARMA(6,4) and the multivariate VAR(17) model not fitted with a seasonal frequency of 52. This yielded an ASE of 411,879.3 which is a substantial improvement over the ARMA(6,4) model itself but is comparable to the VAR(17) model itself. The forecasts (stationary ensemble: red) follow the parabolic behavior exhibited in both the of the weak learTners. However, it also picks up the the dipping behavior at the peaks of the curve that can be seen in the previous two peaks.
+
+```{r ensemble stationary}
+ensemble.stat = (flu.ARMA.fore$f + VAR.preds$fcst$FluCases.X[,1])/2
+plot(FluCases[1:230], type = "l")
+lines(seq(219,230,1), ensemble.stat,col = "red")
+ensembleSTAT.ASE = mean((FluCases[219:230] - ensemble.stat)^2) # 411,879.3
+```
+
+#### Non-stationary Model: ARUMA(5,0,2) w/ s = 52 & Univariate Neural Network 
+The seasonal model ARUMA(5,0,2) with s = 52 was paired with the univariate neural network to analyze the performance of a non-statioanry ensemble model. This ensemble yielded an ASE of 1,403,968 which is an improvement over the MNN but does not perform as well the seasonal model itself. The non-stationary ensmeble forecasts (non-stationary ensemble: blue) overlap the actual 12 weeks well and keep up with the behavior. However, the last two forecasts appear to heavily deviate from the expected values and explains why the ASE is higher than the previous model despite the seemingly better overlap.
+
+This ensemble more closely follows the peak-and-valley trend of the realizations. Although the ASE was higher, this could be due to the last few forecasts also trending up rather than down like the actual data.The selection of the ASE window could also play a role in the variable ASE values as seen in previous seasonal models. A rolling window ASE for this ensemble would likely demonstrate a better overall fit.
+
+```{r ensemble seasonal}
+ensemble.seas = (flu.seasonal.fore$f + f.NN.uni$mean)/2
+ensembleSEAS.ASE = mean((FluCases[219:230] - ensemble.seas)^2) # 1,403,968
+plot(FluCases[1:230], type = "l")
+lines(seq(219,230,1), ensemble.seas, col = "blue", lwd = 2)
+
+# Calculate Prediction Limits
+sd.f.NN.uni = sqrt(sum((f.NN.uni$residuals)^2)/(230 - 6)) # 230 data points w/ 6 explanatory variables 
+MNN.LL = (f.NN.uni$mean - 1.96*sd.f.NN.uni)
+MNN.UL = (f.NN.uni$mean + 1.96*sd.f.NN.uni)
+
+LL = (flu.seasonal.fore$ll + MNN.LL)/2
+UL = (flu.seasonal.fore$ul + MNN.UL)/2
+```
+
+## Forecasts & Prediction Limits
+Based on the analysis of these competing models, the non-stationary ensemble model appear to provide the most useful forecasts of the last 12 weeks. The seasonal ARUMA model was shown to be an appropriate fit for the data with strong evidence for whitened residuals. Although the uniivariate neural network was not a top-performing model, it was able to overlap well with the data before beginning to overestimate the last forecasted month (~ 4 weeks). When paired together, this ensemble model closely follow the behavior exhibited in the data before also beginning to overestimate the last few weeks.
+
+With the time series coming from a non-stationary process, this model appears to be the most useful in describing the trends and behaviors of the data. Although, it requires more fine-tuning to help the last few forecasts better model the data. The ASE for this non-stationary ensemble was 1,403,968 with the following prediction limits provided. A window displaying the last 12 forecasts from this model is shown below at a higher resolution to better analyze how the forecasts are performing.
+
+``` {r Model Forecasts & Prediction Limits}
+ensembleSEAS.ASE
+LL # Prediction Interval Lower Limits
+UL # Prediction Interval Upper Limits
+plot(FluCases[219:230], type = "l", ylim = c(1500,7000))
+lines(seq(1,12), ensemble.seas, col = "blue", lwd = 2)
+lines(seq(1,12), LL, col = "cyan", lwd = 3)
+lines(seq(1,12), UL, col = "cyan", lwd = 3)
+```
+
+
+## Conclusion
+
+The analysis of influenza activity over the past 5 years indicates that the data comes from a non-stationary process. Although, the stationary models consistently performed better in terms of ASE. However, this may be due to the tendency of those models to regress towards the mean. The rolling window ASE showed that the non-stationary ARUMA(5,0,2) w/ s = 52 showed better generalized forecasts over the whole time series rather than just the last 12 forecasted weeks. 
+
+An interesting observation noted when estimating the VAR(17) model with 6 explanatory variables and a seasonal frequency of 52, but not actually fit the VAR model with that frequency, yielded lowest ASE among all models at 358,672. This indicates that the annual trend can't be modeled using seasonal frequency factors (1-B^s).
+
+The final non-stationary ensemble model provided the most useful forecasts that were able to capture some of the behaviors observed in the last 12 weeeks of flu activity, but begins to become unstable and overestimates the last few weeks. Further analyses should look into modeling flu actvity with a deterministic signal using sine or cosine functions with a period of 52 weeks.
