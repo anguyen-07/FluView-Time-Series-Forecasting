@@ -1,4 +1,4 @@
-# FluView-Time-Series-Forecasting
+# FluView-Time-Series-Forecasting (2015-2020)
 Time series data consists of a ordinal sequence of values collected at successive equally spaced points in time. In contrast to cross-sectional data in which information is collected at a single point in time, time series data can be indexed by the date or time when the information was collected. The goals of time series analysis are typically to determine trends or patterns of the collected data over time and building models to forecast future behavior within confidence limits.
 
 Fluview is a weekly influenza surveillance report compiled by the Centers for Disease Control and Prevention (CDC) to analyze flu activity year-round in the United States. Specifics detailing the collection methods and purposes of FluView weekly surveillance report can be found at the following link: https://www.cdc.gov/flu/weekly/overview.htm.
